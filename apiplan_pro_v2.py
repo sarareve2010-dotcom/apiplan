@@ -1,0 +1,310 @@
+import streamlit as st
+import pandas as pd
+from datetime import date, timedelta
+import json
+import plotly.express as px
+
+# ============================
+# CONFIG / MODE D'EMPLOI
+# ============================
+# 1) Installer les dépendances :
+#    pip install -r requirements.txt
+# 2) Lancer l'app :
+#    streamlit run apiplan_pro_v2.py
+#
+# Astuce : change YEAR si tu veux préparer une autre saison.
+YEAR = date.today().year
+
+st.set_page_config(page_title="APIPlan PRO v2 – Multiplication, Élevage, Miel", layout="wide")
+st.title("APIPlan PRO v2 – Multiplication • Élevage • Miel (estimation)")
+st.caption("Tu saisis tes actions + élevage, l’outil calcule objectifs, calendrier, besoins en cellules, et miel estimé (impact divisions).")
+
+# ----------------------------
+# Paramètres généraux
+# ----------------------------
+with st.sidebar:
+    st.header("Pertes & Objectif")
+    loss_created = st.slider("Pertes sur essaims créés (%)", 0, 80, 30, 1) / 100
+    loss_winter = st.slider("Pertes hivernales (%)", 0, 80, 20, 1) / 100
+    target_end = st.number_input("Objectif après hiver (colonies)", min_value=1, value=50, step=1)
+
+    st.divider()
+    st.header("Élevage (réglages)")
+    st.caption("Par défaut : cellules operculées introduites le jour J.")
+    graft_to_capped = st.number_input("Greffage → Cellule operculée (jours)", 6, 14, 10, 1)
+    graft_to_emerge = st.number_input("Greffage → Naissance reine (jours)", 12, 20, 16, 1)
+    emerge_to_mating = st.number_input("Naissance → Fécondation (jours)", 5, 20, 10, 1)
+    mating_to_laying = st.number_input("Fécondation → Ponte stable (jours)", 3, 20, 7, 1)
+
+    st.divider()
+    st.header("Miel (paramètres)")
+    st.caption("Tu règles selon ton secteur/miellées/année.")
+    base_yield = st.number_input("Rendement moyen par ruche productive (kg)", 0.0, 80.0, 18.0, 0.5)
+    # Pénalité miel par division selon le mois (plus tôt = impact + fort)
+    pen_apr = st.number_input("Perte miel par division en AVRIL (kg)", 0.0, 50.0, 6.0, 0.5)
+    pen_may = st.number_input("Perte miel par division en MAI (kg)", 0.0, 50.0, 4.0, 0.5)
+    pen_jun = st.number_input("Perte miel par division en JUIN+ (kg)", 0.0, 50.0, 2.0, 0.5)
+    nuc_yield = st.number_input("Rendement moyen d’une ruchette (kg)", 0.0, 30.0, 0.0, 0.5)
+    st.caption("Astuce pro : mets 0 kg sur ruchette si tu ne veux pas compter de miel dessus.")
+
+# ----------------------------
+# Départ
+# ----------------------------
+st.subheader("1) Cheptel de départ")
+c1, c2, c3 = st.columns(3)
+with c1:
+    start_hives = st.number_input("Ruches au départ", 0, 999, 9, 1)
+with c2:
+    start_nucs = st.number_input("Ruchettes au départ", 0, 999, 7, 1)
+with c3:
+    start_total = start_hives + start_nucs
+    st.metric("Total départ", start_total)
+
+# ----------------------------
+# Sauvegarde/chargement JSON
+# ----------------------------
+def df_to_json(df: pd.DataFrame) -> str:
+    d = df.copy()
+    d["Date"] = pd.to_datetime(d["Date"]).dt.strftime("%Y-%m-%d")
+    return json.dumps(d.to_dict(orient="records"), ensure_ascii=False, indent=2)
+
+def df_from_json(s: str) -> pd.DataFrame:
+    records = json.loads(s)
+    df = pd.DataFrame(records)
+    df["Date"] = pd.to_datetime(df["Date"]).dt.date
+    return df
+
+# ----------------------------
+# ACTIONS (colonies)
+# ----------------------------
+st.subheader("2) Actions colonies (tu remplis)")
+st.caption("⚠️ Important pour le miel : utilise 'Division' / 'Redivision' pour les essaims créés. 'Perte' = pertes constatées (hors %).")
+
+if "actions" not in st.session_state:
+    st.session_state.actions = pd.DataFrame(
+        [
+            {"Date": date(YEAR, 4, 10), "Action": "Division", "Quantité": 10, "Besoin_cellule": True, "Notes": ""},
+            {"Date": date(YEAR, 5, 10), "Action": "Redivision", "Quantité": 10, "Besoin_cellule": True, "Notes": ""},
+        ]
+    )
+
+a1, a2, a3 = st.columns([1, 1, 2])
+with a1:
+    if st.button("➕ Ajouter action"):
+        st.session_state.actions = pd.concat(
+            [st.session_state.actions, pd.DataFrame([{"Date": date.today(), "Action": "Division", "Quantité": 0, "Besoin_cellule": False, "Notes": ""}])],
+            ignore_index=True
+        )
+with a2:
+    if st.button("🧹 Reset exemple (actions)"):
+        st.session_state.actions = pd.DataFrame(
+            [
+                {"Date": date(YEAR, 4, 10), "Action": "Division", "Quantité": 10, "Besoin_cellule": True, "Notes": ""},
+                {"Date": date(YEAR, 5, 10), "Action": "Redivision", "Quantité": 10, "Besoin_cellule": True, "Notes": ""},
+            ]
+        )
+with a3:
+    up = st.file_uploader("Charger plan Actions (JSON)", type=["json"], key="up_actions")
+    if up is not None:
+        st.session_state.actions = df_from_json(up.read().decode("utf-8"))
+
+actions = st.data_editor(
+    st.session_state.actions,
+    use_container_width=True,
+    num_rows="dynamic",
+    column_config={
+        "Date": st.column_config.DateColumn(format="DD/MM/YYYY"),
+        "Action": st.column_config.SelectboxColumn(options=["Division", "Redivision", "Achat", "Perte"]),
+        "Quantité": st.column_config.NumberColumn(min_value=0, step=1),
+        "Besoin_cellule": st.column_config.CheckboxColumn(help="Coche si tu introduis une cellule ce jour-là"),
+        "Notes": st.column_config.TextColumn(),
+    },
+)
+st.session_state.actions = actions.copy()
+
+# ----------------------------
+# DONNEUSES (pour le miel)
+# ----------------------------
+st.subheader("3) Donneuses (pour estimer le miel)")
+st.caption("Ici tu indiques combien de RUCHES tu divises, et quand. Ça sert uniquement à estimer l’impact sur la récolte.")
+
+if "donors" not in st.session_state:
+    st.session_state.donors = pd.DataFrame(
+        [
+            {"Date": date(YEAR, 4, 10), "Ruches_divisées": 6, "Divisions_par_ruche": 1, "Notes": "Série 1"},
+            {"Date": date(YEAR, 5, 10), "Ruches_divisées": 5, "Divisions_par_ruche": 1, "Notes": "Série 2"},
+        ]
+    )
+
+d1, d2, d3 = st.columns([1, 1, 2])
+with d1:
+    if st.button("➕ Ajouter donneuses"):
+        st.session_state.donors = pd.concat(
+            [st.session_state.donors, pd.DataFrame([{"Date": date.today(), "Ruches_divisées": 0, "Divisions_par_ruche": 1, "Notes": ""}])],
+            ignore_index=True
+        )
+with d2:
+    if st.button("🧹 Reset exemple (donneuses)"):
+        st.session_state.donors = pd.DataFrame(
+            [
+                {"Date": date(YEAR, 4, 10), "Ruches_divisées": 6, "Divisions_par_ruche": 1, "Notes": "Série 1"},
+                {"Date": date(YEAR, 5, 10), "Ruches_divisées": 5, "Divisions_par_ruche": 1, "Notes": "Série 2"},
+            ]
+        )
+with d3:
+    up2 = st.file_uploader("Charger plan Donneuses (JSON)", type=["json"], key="up_donors")
+    if up2 is not None:
+        st.session_state.donors = df_from_json(up2.read().decode("utf-8"))
+
+donors = st.data_editor(
+    st.session_state.donors,
+    use_container_width=True,
+    num_rows="dynamic",
+    column_config={
+        "Date": st.column_config.DateColumn(format="DD/MM/YYYY"),
+        "Ruches_divisées": st.column_config.NumberColumn(min_value=0, step=1),
+        "Divisions_par_ruche": st.column_config.NumberColumn(min_value=0, step=1),
+        "Notes": st.column_config.TextColumn(),
+    }
+)
+st.session_state.donors = donors.copy()
+
+# ----------------------------
+# Calculs Colonies
+# ----------------------------
+def compute_colonies(actions_df: pd.DataFrame):
+    d = actions_df.copy()
+    d["Date"] = pd.to_datetime(d["Date"]).dt.date
+    d["Quantité"] = pd.to_numeric(d["Quantité"], errors="coerce").fillna(0).astype(int)
+    d = d.sort_values("Date")
+
+    created_gross = int(d.loc[d["Action"].isin(["Division", "Redivision"]), "Quantité"].sum())
+    bought = int(d.loc[d["Action"] == "Achat", "Quantité"].sum())
+    losses_manual = int(d.loc[d["Action"] == "Perte", "Quantité"].sum())
+
+    created_survive = round(created_gross * (1 - loss_created))
+    pre_winter = start_total + created_survive + bought - losses_manual
+    after_winter = round(pre_winter * (1 - loss_winter))
+
+    needed_pre_winter = int((target_end / (1 - loss_winter)) + 0.9999)  # ceil
+    needed_net_add = max(0, needed_pre_winter - start_total)
+    needed_gross_created = int((needed_net_add / (1 - loss_created)) + 0.9999)  # ceil
+
+    d["Cellules_requises"] = d.apply(
+        lambda r: int(r["Quantité"]) if (r.get("Besoin_cellule", False) and r["Action"] in ["Division", "Redivision"]) else 0,
+        axis=1
+    )
+
+    return d, {
+        "created_gross": created_gross,
+        "created_survive": created_survive,
+        "bought": bought,
+        "losses_manual": losses_manual,
+        "pre_winter": pre_winter,
+        "after_winter": after_winter,
+        "needed_pre_winter": needed_pre_winter,
+        "needed_gross_created": needed_gross_created
+    }
+
+d_actions, k = compute_colonies(actions)
+
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Créés (brut)", k["created_gross"])
+k2.metric("Créés (survivants ~)", k["created_survive"])
+k3.metric("Achats", k["bought"])
+k4.metric("À hiverner (estim.)", k["pre_winter"])
+k5.metric("Après hiver (estim.)", k["after_winter"])
+
+st.info(
+    f"Objectif {target_end} après hiver → viser **{k['needed_pre_winter']} à hiverner**. "
+    f"Avec {start_total} au départ + {int(loss_created*100)}% pertes création, il faut environ **{k['needed_gross_created']} essaims à créer**."
+)
+
+# ----------------------------
+# Timeline (calendrier)
+# ----------------------------
+st.subheader("4) Calendrier (timeline)")
+if not d_actions.empty:
+    dt = d_actions.copy()
+    dt["Start"] = pd.to_datetime(dt["Date"])
+    dt["Finish"] = dt["Start"] + pd.to_timedelta(1, unit="D")
+    dt["Label"] = dt["Date"].astype(str) + " — " + dt["Action"] + " (" + dt["Quantité"].astype(str) + ")"
+    fig = px.timeline(dt, x_start="Start", x_end="Finish", y="Label")
+    fig.update_yaxes(autorange="reversed")
+    st.plotly_chart(fig, use_container_width=True)
+
+# ----------------------------
+# Élevage: planning cellules
+# ----------------------------
+st.subheader("5) Élevage — besoins en cellules & dates")
+need = d_actions[d_actions["Cellules_requises"] > 0][["Date", "Action", "Quantité", "Cellules_requises", "Notes"]].copy()
+if need.empty:
+    st.write("Coche **Besoin_cellule** sur tes divisions/redivisions pour générer le planning élevage.")
+else:
+    need["Date_introduction_cellules"] = need["Date"]
+    need["Date_greffage"] = need["Date"].apply(lambda x: x - timedelta(days=int(graft_to_capped)))
+    need["Naissance_reines_est"] = need["Date_greffage"].apply(lambda x: x + timedelta(days=int(graft_to_emerge)))
+    need["Fécondation_est"] = need["Naissance_reines_est"].apply(lambda x: x + timedelta(days=int(emerge_to_mating)))
+    need["Ponte_stable_est"] = need["Fécondation_est"].apply(lambda x: x + timedelta(days=int(mating_to_laying)))
+    st.dataframe(need, use_container_width=True)
+
+# ----------------------------
+# Miel: estimation avec impact divisions
+# ----------------------------
+st.subheader("6) Miel estimé (impact divisions)")
+st.caption("Modèle simple mais pro : base kg/ruche productive - pénalités par division (selon période). Tu peux régler les kg dans la sidebar.")
+
+def penalty_for_month(d: date):
+    if d.month <= 4:
+        return pen_apr
+    elif d.month == 5:
+        return pen_may
+    else:
+        return pen_jun
+
+don = donors.copy()
+don["Date"] = pd.to_datetime(don["Date"]).dt.date
+don["Ruches_divisées"] = pd.to_numeric(don["Ruches_divisées"], errors="coerce").fillna(0).astype(int)
+don["Divisions_par_ruche"] = pd.to_numeric(don["Divisions_par_ruche"], errors="coerce").fillna(0).astype(int)
+don = don.sort_values("Date")
+
+productive_hives = start_hives
+
+don["Divisions_total"] = don["Ruches_divisées"] * don["Divisions_par_ruche"]
+don["Penalite_par_division"] = don["Date"].apply(penalty_for_month)
+don["Penalite_kg"] = don["Divisions_total"] * don["Penalite_par_division"]
+total_penalty = float(don["Penalite_kg"].sum())
+
+gross_honey = productive_hives * float(base_yield)
+honey_after_penalty = max(0.0, gross_honey - total_penalty)
+
+estimated_nuc_honey = start_nucs * float(nuc_yield)
+total_honey = honey_after_penalty + estimated_nuc_honey
+
+cA, cB, cC = st.columns(3)
+cA.metric("Base (kg) = ruches productives × rendement", f"{gross_honey:.1f}")
+cB.metric("Pénalité divisions (kg)", f"-{total_penalty:.1f}")
+cC.metric("Miel estimé total (kg)", f"{total_honey:.1f}")
+
+if not don.empty:
+    st.write("Détail pénalités divisions :")
+    st.dataframe(don[["Date","Ruches_divisées","Divisions_par_ruche","Divisions_total","Penalite_par_division","Penalite_kg","Notes"]], use_container_width=True)
+
+# ----------------------------
+# Sauvegarde / export
+# ----------------------------
+st.subheader("7) Sauvegarder / Exporter")
+colA, colB, colC, colD = st.columns(4)
+
+with colA:
+    st.download_button("💾 Actions (JSON)", df_to_json(d_actions).encode("utf-8"),
+                       file_name="apiplan_actions.json", mime="application/json")
+with colB:
+    st.download_button("📤 Actions (CSV)", d_actions.to_csv(index=False).encode("utf-8"),
+                       file_name="apiplan_actions.csv", mime="text/csv")
+with colC:
+    st.download_button("💾 Donneuses (JSON)", df_to_json(don).encode("utf-8"),
+                       file_name="apiplan_donneuses.json", mime="application/json")
+with colD:
+    st.download_button("📤 Donneuses (CSV)", don.to_csv(index=False).encode("utf-8"),
+                       file_name="apiplan_donneuses.csv", mime="text/csv")
