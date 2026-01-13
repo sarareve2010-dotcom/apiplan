@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import date, timedelta
 import json
-import plotly.express as px
+# import plotly.express as px
 
 # ============================
 # CONFIG / MODE D'EMPLOI
@@ -229,9 +229,8 @@ if not d_actions.empty:
     dt["Start"] = pd.to_datetime(dt["Date"])
     dt["Finish"] = dt["Start"] + pd.to_timedelta(1, unit="D")
     dt["Label"] = dt["Date"].astype(str) + " — " + dt["Action"] + " (" + dt["Quantité"].astype(str) + ")"
-    fig = px.timeline(dt, x_start="Start", x_end="Finish", y="Label")
-    fig.update_yaxes(autorange="reversed")
-    st.plotly_chart(fig, use_container_width=True)
+st.info("Timeline désactivée temporairement (Plotly)")
+
 
 # ----------------------------
 # Élevage: planning cellules
